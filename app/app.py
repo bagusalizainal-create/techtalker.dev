@@ -12,6 +12,8 @@ import time
 import platform
 import datetime
 import base64
+import tempfile
+import threading
 from urllib.parse import urljoin
 
 app = Flask(__name__)
@@ -20,6 +22,10 @@ START = time.time()
 # Internal service URLs (server-to-server, no CORS issue)
 API_URL  = "http://127.0.0.1:8002"  # FastAPI Notes
 DASH_URL = "http://127.0.0.1:8003"  # Flask Dashboard
+
+# Realtime network rate state (file-backed, shared across gunicorn workers)
+NET_STATE_PATH = "/tmp/techtalker_net_state.json"
+_net_state_lock = threading.Lock()
 
 
 def fetch_json(url: str, timeout: float = 1.5):
@@ -91,6 +97,106 @@ def live_stats():
     return jsonify({
         "server": fetch_json(f"{DASH_URL}/api/stats"),
         "notes":  fetch_json(f"{API_URL}/stats"),
+    })
+
+
+def _read_net_state():
+    try:
+        with open(NET_STATE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _write_net_state(state):
+    # atomic write: tempfile + rename, biar gak setengah jadi kalau crash
+    tmp = NET_STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, NET_STATE_PATH)
+
+
+@app.route("/api/server-realtime")
+def server_realtime():
+    """Realtime VPS metrics dengan network rate (delta antar request).
+    Digunakan frontend tab Server untuk auto-refresh tiap 2 detik.
+    """
+    import psutil  # local import biar gak ke-load kalau endpoint gak kepanggil
+
+    # Sample CPU over 0.3s supaya angka akurat (bukan 0 di first call)
+    cpu_overall = psutil.cpu_percent(interval=0.3)
+    cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    disk = psutil.disk_usage("/")
+    net = psutil.net_io_counters()
+    boot = psutil.boot_time()
+    now = time.time()
+
+    # Load average (Linux only); guard with hasattr
+    try:
+        load1, load5, load15 = psutil.getloadavg()
+    except (AttributeError, OSError):
+        load1 = load5 = load15 = None
+
+    # Network rate (delta vs last sample)
+    net_in_mbs = net_out_mbs = 0.0
+    with _net_state_lock:
+        prev = _read_net_state()
+        if prev:
+            dt = now - prev["ts"]
+            if dt > 0:
+                net_in_mbs  = max(0.0, (net.bytes_recv - prev["rx"]) / dt / (1024 * 1024))
+                net_out_mbs = max(0.0, (net.bytes_sent - prev["tx"]) / dt / (1024 * 1024))
+        _write_net_state({
+            "ts": now, "rx": net.bytes_recv, "tx": net.bytes_sent,
+        })
+
+    # Per-core freq (kalau ada)
+    try:
+        freq = psutil.cpu_freq()
+        cpu_freq_mhz = freq.current if freq else None
+    except Exception:
+        cpu_freq_mhz = None
+
+    return jsonify({
+        "ts": now,
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "boot": boot,
+        "uptime": int(now - boot),
+        "cpu": {
+            "percent": cpu_overall,
+            "per_core": cpu_per_core,
+            "cores_phys": psutil.cpu_count(logical=False) or len(cpu_per_core),
+            "cores_logical": psutil.cpu_count(logical=True) or len(cpu_per_core),
+            "freq_mhz": cpu_freq_mhz,
+        },
+        "memory": {
+            "percent": mem.percent,
+            "used_mb": mem.used // (1024**2),
+            "total_mb": mem.total // (1024**2),
+            "available_mb": mem.available // (1024**2),
+        },
+        "swap": {
+            "percent": swap.percent,
+            "used_mb": swap.used // (1024**2),
+            "total_mb": swap.total // (1024**2),
+        },
+        "disk": {
+            "percent": disk.percent,
+            "used_gb": disk.used // (1024**3),
+            "total_gb": disk.total // (1024**3),
+            "free_gb": disk.free // (1024**3),
+        },
+        "network": {
+            "bytes_sent_mb": net.bytes_sent // (1024**2),
+            "bytes_recv_mb": net.bytes_recv // (1024**2),
+            "in_mbs":  round(net_in_mbs,  3),
+            "out_mbs": round(net_out_mbs, 3),
+        },
+        "load": {"1": load1, "5": load5, "15": load15},
     })
 
 
@@ -229,13 +335,15 @@ def tv_channels():
       search=keyword (optional, search in name)
       group_by=category|none (default: none — flat list)
       limit=N (max channels, default: 500)
-    Setiap channel dapet `proxied_url` (URL yang lewat CORS proxy VPS).
+    Setiap channel sudah punya `proxied_url` (pre-computed in cache).
+    Supports If-None-Match (ETag) → returns 304 if data hasn't changed.
     """
     try:
         from tv import get_channels, filter_channels, group_by_category, COMMON_CATEGORIES
         d = get_channels(force=False)
         all_channels = d.get("channels", [])
         stats = d.get("stats", {})
+        etag = d.get("_meta", {}).get("etag")
 
         country = request.args.get("country", "Indonesia").strip()
         category = request.args.get("category", "").strip()
@@ -246,18 +354,25 @@ def tv_channels():
         except Exception:
             limit = 500
 
-        # Filter
-        filtered = filter_channels(all_channels, country=country, category=category, search=search)
+        # ETag-based 304 short-circuit (saves bandwidth + parse time on country re-switch)
+        # ETag varies per (country, category, search) so a different filter still gets a fresh 200
+        client_etag = request.headers.get("If-None-Match")
+        if etag and client_etag and client_etag == etag:
+            resp = Response(status=304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
+            return resp
 
-        # Group
+        # Filter (now uses pre-built by_country index, O(matches) instead of O(11.5K))
+        filtered = filter_channels(d, country=country, category=category, search=search)
+
+        # Build response — proxied_url is already in cache, no per-request b64 needed
         if group_by == "category":
             grouped = group_by_category(filtered)
-            for cat, chans in grouped.items():
-                for c in chans:
-                    c["proxied_url"] = f"/api/tv/proxy?u={b64e(c['url'])}"
-                if limit:
-                    grouped[cat] = chans[:limit]
-            return jsonify({
+            if limit:
+                for cat in grouped:
+                    grouped[cat] = grouped[cat][:limit]
+            resp = jsonify({
                 "country": country,
                 "category": category or None,
                 "search": search or None,
@@ -272,21 +387,26 @@ def tv_channels():
                 "meta": d.get("_meta", {}),
             })
         else:
-            # Flat list (default)
-            for c in filtered:
-                c["proxied_url"] = f"/api/tv/proxy?u={b64e(c['url'])}"
-            return jsonify({
+            # Flat list (default) — proxied_url comes from cache
+            channels_out = filtered[:limit] if limit else filtered
+            resp = jsonify({
                 "country": country,
                 "category": category or None,
                 "search": search or None,
                 "total_filtered": len(filtered),
-                "channels": filtered[:limit] if limit else filtered,
+                "channels": channels_out,
                 "stats": {
                     "by_country": stats.get("by_country", {}),
                     "by_category": stats.get("by_category", {}),
                 },
                 "meta": d.get("_meta", {}),
             })
+
+        # HTTP cache headers — safe to cache up to 5 min, then must revalidate
+        if etag:
+            resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
+        return resp
     except Exception as e:
         return jsonify({"error": str(e), "channels": [], "by_category": {}}), 500
 
@@ -308,11 +428,12 @@ def b64d(s: str) -> str | None:
         return None
 
 
-@app.route("/api/tv/proxy")
+@app.route("/api/tv/proxy", methods=["GET", "OPTIONS"])
 def tv_proxy():
     """Generic CORS proxy untuk TV stream.
     Forward request ke external URL, return content dengan CORS headers.
     Untuk .m3u8 playlist, rewrite segment URLs agar juga lewat proxy.
+    Untuk content lain (.ts segments dll), STREAM langsung (no memory bloat).
     """
     enc = request.args.get("u", "")
     original_url = b64d(enc) if enc else None
@@ -332,57 +453,69 @@ def tv_proxy():
 
     try:
         req = urllib.request.Request(original_url, headers=fwd_headers)
-        with urllib.request.urlopen(req, timeout=15) as r:
+        r = urllib.request.urlopen(req, timeout=15)
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        content_length = r.headers.get("Content-Length")
+        status_code = r.status
+
+        # Detect & rewrite .m3u8 playlist (must read fully to rewrite lines)
+        is_m3u8 = (
+            "mpegurl" in content_type.lower()
+            or "vnd.apple.mpegurl" in content_type.lower()
+            or original_url.lower().split("?")[0].endswith(".m3u8")
+            or original_url.lower().split("?")[0].endswith(".m3u")
+        )
+
+        if is_m3u8:
+            # M3U8 playlists are small (< 50KB usually) — read fully, rewrite
             content = r.read()
-            content_type = r.headers.get("Content-Type", "application/octet-stream")
-            content_length = r.headers.get("Content-Length")
+            r.close()
+            try:
+                text = content.decode("utf-8", errors="ignore")
+                new_lines = []
+                for line in text.splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        new_lines.append(line)
+                        continue
+                    if s.startswith("http://") or s.startswith("https://"):
+                        abs_url = s
+                    else:
+                        abs_url = urljoin(original_url, s)
+                    new_lines.append(f"/api/tv/proxy?u={b64e(abs_url)}")
+                content = "\n".join(new_lines).encode("utf-8")
+                content_type = "application/vnd.apple.mpegurl"
+                content_length = str(len(content))
+            except Exception as e:
+                print(f"  [proxy] m3u8 rewrite failed: {e}")
 
-            # Detect & rewrite .m3u8 playlist (CORS issue: segment URLs must also go via proxy)
-            is_m3u8 = (
-                "mpegurl" in content_type.lower()
-                or "vnd.apple.mpegurl" in content_type.lower()
-                or (content[:7] == b"#EXTM3U")
-                or original_url.lower().split("?")[0].endswith(".m3u8")
-                or original_url.lower().split("?")[0].endswith(".m3u")
-            )
-            if is_m3u8:
+            resp = Response(content, status=status_code, mimetype=content_type)
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        else:
+            # .ts / .mp4 / other binary — STREAM to avoid loading large segments into memory
+            def generate():
                 try:
-                    text = content.decode("utf-8", errors="ignore")
-                    new_lines = []
-                    for line in text.splitlines():
-                        s = line.strip()
-                        # Skip comments/empty
-                        if not s or s.startswith("#"):
-                            new_lines.append(line)
-                            continue
-                        # Resolve to absolute URL
-                        if s.startswith("http://") or s.startswith("https://"):
-                            abs_url = s
-                        elif s.startswith("/"):
-                            abs_url = urljoin(original_url, s)
-                        else:
-                            abs_url = urljoin(original_url, s)
-                        # Encode through our proxy
-                        new_lines.append(f"/api/tv/proxy?u={b64e(abs_url)}")
-                    content = "\n".join(new_lines).encode("utf-8")
-                    content_type = "application/vnd.apple.mpegurl"
-                    content_length = str(len(content))
-                except Exception as e:
-                    # Fallback: serve as-is
-                    print(f"  [proxy] m3u8 rewrite failed: {e}")
+                    while True:
+                        chunk = r.read(64 * 1024)  # 64KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
 
-            resp = Response(content, mimetype=content_type)
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Range, If-Range"
-            # Caching: short for live streams, longer for static
-            if is_m3u8:
-                resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            else:
-                resp.headers["Cache-Control"] = "public, max-age=10"
-            if content_length:
-                resp.headers["Content-Length"] = content_length
-            return resp
+            resp = Response(generate(), status=status_code, mimetype=content_type)
+            resp.headers["Cache-Control"] = "public, max-age=10"
+
+        # Common CORS + cache headers
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Range, If-Range"
+        if content_length:
+            resp.headers["Content-Length"] = content_length
+        return resp
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"upstream {e.code}: {e.reason}"}), 502
     except Exception as e:
@@ -530,6 +663,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>techtalkerid.dev — Portal</title>
+<!-- Preconnect to logo CDNs — saves TLS handshake on first logo of each page load -->
+<link rel="preconnect" href="https://i.imgur.com" crossorigin>
+<link rel="preconnect" href="https://i.postimg.cc" crossorigin>
+<link rel="preconnect" href="https://i.ibb.co" crossorigin>
+<link rel="preconnect" href="https://upload.wikimedia.org" crossorigin>
+<link rel="preconnect" href="https://thumbor.prod.vidiocdn.com" crossorigin>
+<link rel="dns-prefetch" href="https://i.imgur.com">
+<link rel="dns-prefetch" href="https://i.postimg.cc">
+<link rel="dns-prefetch" href="https://i.ibb.co">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -593,6 +735,20 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .stat .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2));
                      transition: width 0.5s; }
   .v-warn { color: var(--warn) !important; } .v-crit { color: var(--crit) !important; }
+
+  /* Realtime sparkline (mini chart di tiap card) */
+  .rt-spark { width:100%; height:28px; margin-top:6px; display:block; background:var(--bg);
+              border-radius:4px; }
+  .rt-core { background:var(--bg2); border:1px solid var(--bg3); border-radius:6px;
+             padding:6px 8px; min-width:80px; text-align:center; }
+  .rt-core .lbl { font-size:0.65rem; color:var(--fg3); text-transform:uppercase; letter-spacing:1px; }
+  .rt-core .v   { font-size:0.95rem; font-weight:700; color:var(--fg); margin-top:2px; }
+  .rt-core .b   { background:var(--bg3); height:4px; border-radius:2px; margin-top:4px; overflow:hidden; }
+  .rt-core .bf  { height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2));
+                  transition: width 0.4s; }
+  .rt-trend-up   { color: var(--warn); }
+  .rt-trend-down { color: var(--accent); }
+  .rt-trend-flat { color: var(--fg3); }
 
   h2.section-title { font-size: 0.85rem; text-transform: uppercase; color: var(--fg3);
                      letter-spacing: 2px; margin-bottom: 14px; padding-left: 4px; }
@@ -743,7 +899,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   /* === WC26 (Menu Bar App Style) ======================== */
   /* ====================================================== */
   .wc26-wrap {
-    max-width: 720px;
+    max-width: 900px;
     margin: 0 auto;
   }
   .wc26-popover {
@@ -824,6 +980,35 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
   .wc26-section { padding: 10px 12px 6px; }
   .wc26-section + .wc26-section { border-top: 1px solid rgba(255,255,255,0.04); }
+
+  /* 2-column layout: Jadwal (kiri) | Hasil (kanan) */
+  .wc26-2col {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+  }
+  .wc26-2col > .wc26-section {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .wc26-2col > .wc26-section + .wc26-section { border-top: none; border-left: 1px solid rgba(255,255,255,0.06); }
+  .wc26-2col .wc26-list {
+    max-height: 62vh;
+    overflow-y: auto;
+    padding-right: 2px;
+  }
+  .wc26-2col .wc26-list::-webkit-scrollbar { width: 5px; }
+  .wc26-2col .wc26-list::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+  .wc26-2col .wc26-list::-webkit-scrollbar-track { background: transparent; }
+  .wc26-2col .wc26-section-title { padding-left: 4px; padding-right: 4px; }
+  .wc26-2col .wc26-match { font-size: 0.78rem; padding: 6px 8px; }
+  .wc26-2col .wc26-match .wc26-badge, .wc26-2col .wc26-match .wc26-badge-fb { width: 18px; height: 18px; }
+  .wc26-2col .wc26-match .wc26-center { min-width: 52px; }
+  .wc26-2col .wc26-match .wc26-score { font-size: 0.88rem; }
+  @media (max-width: 640px) {
+    .wc26-2col { flex-direction: column; }
+    .wc26-2col > .wc26-section + .wc26-section { border-top: 1px solid rgba(255,255,255,0.04); border-left: none; }
+  }
   .wc26-section-title {
     display: flex; align-items: center; gap: 6px;
     font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1.5px;
@@ -1170,15 +1355,78 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
   <!-- ========== SERVER ========== -->
   <div id="sec-server" class="section">
-    <h2 class="section-title">📊 Server — live monitoring</h2>
+    <h2 class="section-title">📊 Server — live monitoring
+      <span style="font-size:0.72rem;font-weight:400;color:var(--fg3);margin-left:10px">
+        <span id="rt-status" style="color:var(--accent)">● live</span>
+        <span style="margin-left:8px">↻ <span id="rt-updated">…</span></span>
+      </span>
+    </h2>
 
     <div class="stats" id="stats2">
-      <div class="stat"><div class="label">CPU</div><div class="value" id="s2-cpu">–</div><div class="small" id="s2-cpu-sub">…</div><div class="bar"><div class="bar-fill" id="s2-cpu-bar"></div></div></div>
-      <div class="stat"><div class="label">Memory</div><div class="value" id="s2-mem">–</div><div class="small" id="s2-mem-sub">…</div><div class="bar"><div class="bar-fill" id="s2-mem-bar"></div></div></div>
-      <div class="stat"><div class="label">Disk (/)</div><div class="value" id="s2-disk">–</div><div class="small" id="s2-disk-sub">…</div><div class="bar"><div class="bar-fill" id="s2-disk-bar"></div></div></div>
-      <div class="stat"><div class="label">Network ↑</div><div class="value" id="s2-netup">–</div><div class="small">sent</div></div>
-      <div class="stat"><div class="label">Network ↓</div><div class="value" id="s2-netdn">–</div><div class="small">received</div></div>
-      <div class="stat"><div class="label">Uptime</div><div class="value" id="s2-up">–</div><div class="small" id="s2-up-sub">…</div></div>
+      <div class="stat">
+        <div class="label">CPU <span id="rt-cpu-trend" style="color:var(--fg3);font-weight:400"></span></div>
+        <div class="value" id="s2-cpu">–</div>
+        <div class="small" id="s2-cpu-sub">…</div>
+        <div class="bar"><div class="bar-fill" id="s2-cpu-bar"></div></div>
+        <canvas class="rt-spark" id="rt-spark-cpu" width="200" height="28"></canvas>
+      </div>
+      <div class="stat">
+        <div class="label">Memory <span id="rt-mem-trend" style="color:var(--fg3);font-weight:400"></span></div>
+        <div class="value" id="s2-mem">–</div>
+        <div class="small" id="s2-mem-sub">…</div>
+        <div class="bar"><div class="bar-fill" id="s2-mem-bar"></div></div>
+        <canvas class="rt-spark" id="rt-spark-mem" width="200" height="28"></canvas>
+      </div>
+      <div class="stat">
+        <div class="label">Disk (/)</div>
+        <div class="value" id="s2-disk">–</div>
+        <div class="small" id="s2-disk-sub">…</div>
+        <div class="bar"><div class="bar-fill" id="s2-disk-bar"></div></div>
+      </div>
+      <div class="stat">
+        <div class="label">Network ↑</div>
+        <div class="value" id="s2-netup">–</div>
+        <div class="small" id="s2-netup-sub">sent</div>
+      </div>
+      <div class="stat">
+        <div class="label">Network ↓</div>
+        <div class="value" id="s2-netdn">–</div>
+        <div class="small" id="s2-netdn-sub">received</div>
+      </div>
+      <div class="stat">
+        <div class="label">Uptime</div>
+        <div class="value" id="s2-up">–</div>
+        <div class="small" id="s2-up-sub">…</div>
+      </div>
+    </div>
+
+    <div class="stats" id="stats2b" style="margin-top:10px">
+      <div class="stat">
+        <div class="label">Load avg (1/5/15m)</div>
+        <div class="value" id="rt-load" style="font-size:1.1rem">–</div>
+        <div class="small" id="rt-load-sub">cores × 1.0 = normal</div>
+      </div>
+      <div class="stat">
+        <div class="label">Swap</div>
+        <div class="value" id="rt-swap">–</div>
+        <div class="small" id="rt-swap-sub">…</div>
+        <div class="bar"><div class="bar-fill" id="rt-swap-bar"></div></div>
+      </div>
+      <div class="stat">
+        <div class="label">Net rate ↓</div>
+        <div class="value" id="rt-netin" style="font-size:1.2rem">–</div>
+        <div class="small">MB/s received</div>
+      </div>
+      <div class="stat">
+        <div class="label">Net rate ↑</div>
+        <div class="value" id="rt-netout" style="font-size:1.2rem">–</div>
+        <div class="small">MB/s sent</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 style="font-size:0.95rem;margin-bottom:10px;color:var(--fg)">CPU per-core (live)</h3>
+      <div id="rt-cores" style="display:flex;gap:6px;flex-wrap:wrap;padding:4px 0">Loading…</div>
     </div>
 
     <div class="panel">
@@ -1187,7 +1435,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="panel">
-      <h3 style="font-size:0.95rem;margin-bottom:10px;color:var(--fg)">Riwayat CPU & Memory (20 sample terakhir)</h3>
+      <h3 style="font-size:0.95rem;margin-bottom:10px;color:var(--fg)">Riwayat CPU &amp; Memory (60 sample terakhir, polling 2 dtk)</h3>
       <canvas id="chart" width="800" height="160" style="width:100%;height:160px;background:var(--bg);border-radius:8px"></canvas>
     </div>
   </div>
@@ -1242,20 +1490,21 @@ PAGE_HTML = r"""<!DOCTYPE html>
             <div id="wc26-fav-list" class="wc26-list"></div>
           </div>
 
-          <!-- Today / Tomorrow / Upcoming -->
-          <div class="wc26-section">
-            <div class="wc26-section-title">
-              <span>📅 Jadwal</span>
+          <!-- 2-column: Jadwal (kiri) | Hasil (kanan) -->
+          <div class="wc26-2col">
+            <div class="wc26-section wc26-col-left">
+              <div class="wc26-section-title">
+                <span>📅 Jadwal</span>
+              </div>
+              <div id="wc26-upcoming-list" class="wc26-list"></div>
             </div>
-            <div id="wc26-upcoming-list" class="wc26-list"></div>
-          </div>
 
-          <!-- Recent results -->
-          <div class="wc26-section">
-            <div class="wc26-section-title">
-              <span>✅ Hasil</span>
+            <div class="wc26-section wc26-col-right">
+              <div class="wc26-section-title">
+                <span>✅ Hasil</span>
+              </div>
+              <div id="wc26-recent-list" class="wc26-list"></div>
             </div>
-            <div id="wc26-recent-list" class="wc26-list"></div>
           </div>
         </div>
 
@@ -1589,7 +1838,19 @@ async function loadStats(prefix='') {
       const upH = Math.floor(stats.uptime_seconds / 3600);
       const upM = Math.floor((stats.uptime_seconds % 3600) / 60);
       set('s-up', upH + 'h ' + upM + 'm');
-      // Server tab specific
+      // Server tab (prefix s2-)
+      set('s2-cpu', cpu.toFixed(1) + '%', cpu > 80 ? 'v-crit' : cpu > 50 ? 'v-warn' : '');
+      document.getElementById($('s2-cpu-sub')).textContent = stats.cpu.cores + ' cores';
+      const s2CpuBar = document.getElementById($('s2-cpu-bar'));
+      if (s2CpuBar) s2CpuBar.style.width = cpu + '%';
+      set('s2-mem', mem.toFixed(1) + '%', mem > 80 ? 'v-crit' : mem > 50 ? 'v-warn' : '');
+      document.getElementById($('s2-mem-sub')).textContent = stats.memory.used_mb + ' / ' + stats.memory.total_mb + ' MB';
+      const s2MemBar = document.getElementById($('s2-mem-bar'));
+      if (s2MemBar) s2MemBar.style.width = mem + '%';
+      set('s2-disk', disk.toFixed(1) + '%', disk > 80 ? 'v-crit' : disk > 50 ? 'v-warn' : '');
+      document.getElementById($('s2-disk-sub')).textContent = stats.disk.used_gb + ' / ' + stats.disk.total_gb + ' GB';
+      const s2DiskBar = document.getElementById($('s2-disk-bar'));
+      if (s2DiskBar) s2DiskBar.style.width = disk + '%';
       const upH2 = Math.floor(stats.uptime_seconds / 3600);
       const upM2 = Math.floor((stats.uptime_seconds % 3600) / 60);
       const upS2 = stats.uptime_seconds % 60;
@@ -1718,20 +1979,227 @@ document.getElementById('n-clear-search').addEventListener('click', () => {
 });
 
 // ============== SERVER (chart) ==============
+// ============== SERVER (realtime) ==============
+let rtTimer = null;
+let rtHistory = [];   // [{t, cpu, mem, netIn, netOut}, ...] max 60 sample
+let lastCpu = lastMem = null;
+let rtCoresRendered = false;
+
+function setText(id, txt, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = txt;
+  if (cls) el.className = 'value ' + cls;
+}
+
+function fmtBytes(mb) {
+  if (mb < 1024) return Math.round(mb) + ' MB';
+  return (mb / 1024).toFixed(2) + ' GB';
+}
+
+function fmtUptime(sec) {
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function trendArrow(curr, prev) {
+  if (prev == null) return '';
+  const d = curr - prev;
+  if (Math.abs(d) < 0.2) return '<span class="rt-trend-flat"> → flat</span>';
+  if (d > 0)  return `<span class="rt-trend-up"> ▲ +${d.toFixed(1)}</span>`;
+  return `<span class="rt-trend-down"> ▼ ${d.toFixed(1)}</span>`;
+}
+
+function drawSparkline(canvasId, data, color) {
+  const c = document.getElementById(canvasId);
+  if (!c) return;
+  // Resize canvas ke lebar card biar sharp (HiDPI)
+  const w = c.clientWidth || 200;
+  const h = 28;
+  if (c.width !== w * 2) { c.width = w * 2; c.height = h * 2; }
+  const ctx = c.getContext('2d');
+  // Reset transform (penting — ctx.scale() kumulatif antar call, jadi reset dulu)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.scale(2, 2);
+  ctx.clearRect(0, 0, w, h);
+  if (data.length < 2) {
+    ctx.fillStyle = '#475569';
+    ctx.font = '10px sans-serif';
+    ctx.fillText('… collecting', 4, h / 2 + 3);
+    return;
+  }
+  const max = 100;
+  // background grid line 50%
+  ctx.strokeStyle = '#1e293b';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2);
+  ctx.stroke();
+  // line
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const step = w / (data.length - 1);
+  data.forEach((v, i) => {
+    const x = i * step;
+    const y = h - (v / max) * (h - 4) - 2;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  // last point dot
+  const lastY = h - (data[data.length - 1] / max) * (h - 4) - 2;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(w - 1, lastY, 2.2, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function renderCores(perCore) {
+  const wrap = document.getElementById('rt-cores');
+  if (!wrap) return;
+  wrap.innerHTML = perCore.map((v, i) => {
+    const cls = v > 80 ? 'v-crit' : v > 50 ? 'v-warn' : '';
+    return `<div class="rt-core">
+      <div class="lbl">core ${i}</div>
+      <div class="v ${cls}">${v.toFixed(0)}%</div>
+      <div class="b"><div class="bf" style="width:${Math.min(100, v)}%"></div></div>
+    </div>`;
+  }).join('');
+  rtCoresRendered = true;
+}
+
+function updateCoresDelta(perCore) {
+  if (!rtCoresRendered) { renderCores(perCore); return; }
+  perCore.forEach((v, i) => {
+    const card = document.querySelectorAll('#rt-cores .rt-core')[i];
+    if (!card) return;
+    const vEl = card.querySelector('.v');
+    const bEl = card.querySelector('.bf');
+    if (vEl) {
+      vEl.textContent = v.toFixed(0) + '%';
+      vEl.className = 'v ' + (v > 80 ? 'v-crit' : v > 50 ? 'v-warn' : '');
+    }
+    if (bEl) bEl.style.width = Math.min(100, v) + '%';
+  });
+}
+
 async function loadServer() {
-  // stats sudah di-handle sama loadStats() (prefix '')
+  // First paint: langsung fetch, lalu set interval 2 detik
+  await pollRealtime();
+  if (rtTimer) clearInterval(rtTimer);
+  rtTimer = setInterval(pollRealtime, 2000);
+}
+
+async function pollRealtime() {
   try {
-    const svc = await fetch('/api/services').then(r => r.json());
-    const sys = svc.server;
+    const r = await fetch('/api/server-realtime', {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+
+    // Status indicator
+    const status = document.getElementById('rt-status');
+    const upd = document.getElementById('rt-updated');
+    if (status) { status.textContent = '● live'; status.style.color = 'var(--accent)'; }
+    if (upd) upd.textContent = new Date(d.ts * 1000).toLocaleTimeString('id-ID');
+
+    // CPU
+    const cpu = d.cpu.percent;
+    setText('s2-cpu', cpu.toFixed(1) + '%', cpu > 80 ? 'v-crit' : cpu > 50 ? 'v-warn' : '');
+    document.getElementById('s2-cpu-sub').textContent =
+      d.cpu.cores_phys + ' phys / ' + d.cpu.cores_logical + ' log' +
+      (d.cpu.freq_mhz ? ' • ' + d.cpu.freq_mhz.toFixed(0) + ' MHz' : '');
+    document.getElementById('s2-cpu-bar').style.width = cpu + '%';
+    document.getElementById('rt-cpu-trend').innerHTML = trendArrow(cpu, lastCpu);
+
+    // Memory
+    const mem = d.memory.percent;
+    setText('s2-mem', mem.toFixed(1) + '%', mem > 80 ? 'v-crit' : mem > 50 ? 'v-warn' : '');
+    document.getElementById('s2-mem-sub').textContent =
+      d.memory.used_mb + ' / ' + d.memory.total_mb + ' MB • avail ' + d.memory.available_mb + ' MB';
+    document.getElementById('s2-mem-bar').style.width = mem + '%';
+    document.getElementById('rt-mem-trend').innerHTML = trendArrow(mem, lastMem);
+
+    // Disk
+    const disk = d.disk.percent;
+    setText('s2-disk', disk.toFixed(1) + '%', disk > 80 ? 'v-crit' : disk > 50 ? 'v-warn' : '');
+    document.getElementById('s2-disk-sub').textContent =
+      d.disk.used_gb + ' / ' + d.disk.total_gb + ' GB • free ' + d.disk.free_gb + ' GB';
+    document.getElementById('s2-disk-bar').style.width = disk + '%';
+
+    // Network total (kumulatif)
+    setText('s2-netup', fmtBytes(d.network.bytes_sent_mb), d.network.out_mbs > 1 ? 'v-warn' : '');
+    document.getElementById('s2-netup-sub').textContent =
+      'total sent (' + d.network.out_mbs.toFixed(2) + ' MB/s)';
+    setText('s2-netdn', fmtBytes(d.network.bytes_recv_mb), d.network.in_mbs > 1 ? 'v-warn' : '');
+    document.getElementById('s2-netdn-sub').textContent =
+      'total recv (' + d.network.in_mbs.toFixed(2) + ' MB/s)';
+
+    // Net rate (realtime)
+    setText('rt-netin', d.network.in_mbs.toFixed(3));
+    setText('rt-netout', d.network.out_mbs.toFixed(3));
+
+    // Uptime
+    document.getElementById('s2-up').textContent = fmtUptime(d.uptime);
+    document.getElementById('s2-up-sub').textContent =
+      'booted ' + new Date(d.boot * 1000).toLocaleString('id-ID');
+
+    // Load avg
+    if (d.load && d.load[1] != null) {
+      const cores = d.cpu.cores_logical;
+      const norm = (v) => v < cores * 0.7 ? 'v-warn' : ''; // load > cores = overload
+      document.getElementById('rt-load').textContent =
+        d.load[1].toFixed(2) + ' / ' + d.load[5].toFixed(2) + ' / ' + d.load[15].toFixed(2);
+      document.getElementById('rt-load-sub').textContent =
+        cores + ' cores • ' + (d.load[1] < cores ? 'normal' : 'overload');
+    } else {
+      document.getElementById('rt-load').textContent = 'n/a';
+    }
+
+    // Swap
+    setText('rt-swap', d.swap.percent.toFixed(1) + '%', d.swap.percent > 50 ? 'v-warn' : '');
+    document.getElementById('rt-swap-sub').textContent =
+      d.swap.used_mb + ' / ' + d.swap.total_mb + ' MB';
+    document.getElementById('rt-swap-bar').style.width = d.swap.percent + '%';
+
+    // CPU per-core
+    updateCoresDelta(d.cpu.per_core);
+
+    // System detail panel
     document.getElementById('sys-detail').innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;text-align:left">
-        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Hostname</small><div style="color:var(--fg);font-weight:600">${escapeHtml(sys.hostname)}</div></div>
-        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Platform</small><div style="color:var(--fg);font-weight:600">${escapeHtml(sys.platform.split('-')[0])}</div></div>
-        <div><small style="color:var(--fg);font-weight:600">${escapeHtml(sys.python)}</small><div style="color:var(--fg3);font-size:0.78rem">Python version</div></div>
-        <div><small style="color:var(--fg);font-weight:600">${new Date(sys.now).toLocaleString('id-ID')}</small><div style="color:var(--fg3);font-size:0.78rem">Server time (UTC)</div></div>
+        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Hostname</small>
+             <div style="color:var(--fg);font-weight:600">${escapeHtml(d.hostname)}</div></div>
+        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Platform</small>
+             <div style="color:var(--fg);font-weight:600">${escapeHtml(d.platform.split('-')[0])}</div></div>
+        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Python</small>
+             <div style="color:var(--fg);font-weight:600">${escapeHtml(d.python)}</div></div>
+        <div><small style="color:var(--fg3);text-transform:uppercase;font-size:0.72rem">Sample interval</small>
+             <div style="color:var(--accent);font-weight:600">2 detik</div></div>
       </div>
     `;
-  } catch (e) {}
+
+    // History chart (pakai data realtime juga, max 60 sample = 2 menit)
+    rtHistory.push({t: d.ts, cpu, mem, netIn: d.network.in_mbs, netOut: d.network.out_mbs});
+    if (rtHistory.length > 60) rtHistory.shift();
+    // Sinkronkan ke global `history` (const, jadi mutate isinya) untuk drawChart()
+    history.length = 0;
+    rtHistory.forEach(h => history.push({t: h.t, cpu: h.cpu, mem: h.mem}));
+    drawChart();
+    drawSparkline('rt-spark-cpu', rtHistory.map(h => h.cpu), '#4ade80');
+    drawSparkline('rt-spark-mem', rtHistory.map(h => h.mem), '#22d3ee');
+
+    lastCpu = cpu;
+    lastMem = mem;
+  } catch (e) {
+    const status = document.getElementById('rt-status');
+    if (status) { status.textContent = '● offline'; status.style.color = 'var(--crit)'; }
+    console.warn('Realtime poll error:', e);
+  }
 }
 
 function drawChart() {
@@ -2527,19 +2995,43 @@ document.addEventListener('keydown', e => {
 });
 
 // ============== TV (Live TV — flat list with liveness check) ==============
-let tvChannels = [];   // flat list (all matching filter)
+let tvChannels = [];   // flat list (all matching filter for current country)
 let tvCurrent = null;
 let tvHls = null;
 let tvCountry = 'Indonesia';
 let tvSearch = '';
 let tvLiveness = {};   // map url -> {status, code}
 let tvWorkingOnly = false;
+// Per-country in-memory cache: { countryKey: { channels, liveness, ts } }
+// Avoids re-fetching when user switches back to a previously viewed country.
+const tvCache = new Map();
+const TV_CACHE_TTL_MS = 5 * 60 * 1000;  // 5 minutes client-side cache
+let tvCurrentETag = null;  // for If-None-Match on subsequent fetches
+// Pagination
+const TV_PAGE_SIZE = 36;   // cards visible per page
+let tvVisibleCount = TV_PAGE_SIZE;
 
 async function loadTV() {
   const meta = document.getElementById('tv-meta');
   const grid = document.getElementById('tv-grid');
   meta.textContent = 'Loading…';
-  // Try up to 2 times on failure
+  tvVisibleCount = TV_PAGE_SIZE;  // reset pagination on (re)load
+
+  // Build cache key (country + search)
+  const cacheKey = `${tvCountry}::${tvSearch}`;
+
+  // 1) Check client-side cache first — instant render if hit
+  const cached = tvCache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < TV_CACHE_TTL_MS) {
+    tvChannels = cached.channels;
+    tvLiveness = cached.liveness || {};
+    tvCurrentETag = cached.etag || null;
+    updateTVMeta(cached.meta, tvChannels.length);
+    renderTVFlat();
+    return;
+  }
+
+  // 2) Fetch from server (with ETag for 304 short-circuit on re-fetch)
   let lastErr = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -2547,26 +3039,54 @@ async function loadTV() {
       params.set('country', tvCountry);
       if (tvSearch) params.set('search', tvSearch);
       const url = '/api/tv/channels?' + params.toString();
-      const data = await fetch(url, {signal: AbortSignal.timeout(30000)}).then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      });
+
+      // Build headers with conditional ETag (saves bandwidth if server still has same data).
+      // Only attach If-None-Match when we already have a cached response to fall back to.
+      // Otherwise a 304 leaves us with no payload and we'd have to retry.
+      const fetchHeaders = {};
+      if (cached && cached.etag) {
+        fetchHeaders['If-None-Match'] = cached.etag;
+      }
+
+      const resp = await fetch(url, {signal: AbortSignal.timeout(30000), headers: fetchHeaders});
+      if (resp.status === 304 && cached) {
+        // Server confirms data hasn't changed — refresh cache timestamp
+        cached.ts = Date.now();
+        tvChannels = cached.channels;
+        tvLiveness = cached.liveness || {};
+        updateTVMeta(cached.meta, tvChannels.length);
+        renderTVFlat();
+        return;
+      }
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const data = await resp.json();
       if (data.error) throw new Error(data.error);
+
       tvChannels = data.channels || [];
       const m = data.meta || {};
+      const etag = resp.headers.get('ETag');
+      tvCurrentETag = etag || null;
       const total = data.total_filtered || 0;
-      const lu = m.last_refresh ? new Date(m.last_refresh).toLocaleString('id-ID') : '?';
-      meta.textContent = `Last update: ${lu} • ${total} channels`;
-      document.getElementById('tv-count').textContent = `(${tvChannels.length})`;
+      updateTVMeta(m, total);
+
       // Try to load cached liveness (silent fail)
       try {
         const livenessData = await fetch(`/api/tv/liveness?country=${encodeURIComponent(tvCountry)}`, {signal: AbortSignal.timeout(5000)}).then(r => r.json());
         if (livenessData.results) {
           tvLiveness = {};
           for (const r of livenessData.results) tvLiveness[r.url] = r;
-          updateLiveStatus();
         }
       } catch (e) { /* ignore liveness load failure */ }
+
+      // Save to client cache for instant switch back
+      tvCache.set(cacheKey, {
+        channels: tvChannels,
+        liveness: {...tvLiveness},
+        meta: m,
+        etag: etag,
+        ts: Date.now(),
+      });
+
       renderTVFlat();
       return; // success
     } catch (e) {
@@ -2581,6 +3101,13 @@ async function loadTV() {
     <button class="btn secondary small" onclick="loadTV()" style="margin-top:8px">🔄 Coba lagi</button>
   </div>`;
   meta.textContent = 'Error';
+}
+
+function updateTVMeta(m, total) {
+  const meta = document.getElementById('tv-meta');
+  const lu = m.last_refresh ? new Date(m.last_refresh).toLocaleString('id-ID') : '?';
+  meta.textContent = `Last update: ${lu} • ${total} channels`;
+  document.getElementById('tv-count').textContent = `(${tvChannels.length})`;
 }
 
 function updateLiveStatus() {
@@ -2611,7 +3138,21 @@ function renderTVFlat() {
     }
     return;
   }
-  grid.innerHTML = chans.map(c => renderTVCard(c)).join('');
+
+  // Pagination: show only first N cards, "Load more" reveals the rest
+  // Keeps DOM small for fast first paint; user can progressively load more.
+  const visible = chans.slice(0, tvVisibleCount);
+  const hasMore = chans.length > visible.length;
+
+  // Use DocumentFragment for fast batch insertion
+  const frag = document.createDocumentFragment();
+  const tmp = document.createElement('div');
+  tmp.innerHTML = visible.map(c => renderTVCard(c)).join('');
+  while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+  grid.innerHTML = '';
+  grid.appendChild(frag);
+
+  // Attach click handlers (single delegation, no per-card listener leak)
   grid.querySelectorAll('.tv-card').forEach(card => {
     card.addEventListener('click', () => {
       const ch = {
@@ -2624,6 +3165,34 @@ function renderTVFlat() {
       playChannel(ch);
     });
   });
+
+  // Update meta with visible/total ratio if paginated
+  const meta = document.getElementById('tv-count');
+  if (hasMore || chans.length !== tvChannels.length) {
+    meta.textContent = `(showing ${visible.length} of ${chans.length}${tvWorkingOnly ? ' working' : ''})`;
+  } else {
+    meta.textContent = `(${tvChannels.length})`;
+  }
+
+  // Append "Load more" button if there's more
+  if (hasMore) {
+    const moreWrap = document.createElement('div');
+    moreWrap.className = 'tv-load-more-wrap';
+    moreWrap.style.gridColumn = '1 / -1';
+    moreWrap.style.textAlign = 'center';
+    moreWrap.style.padding = '12px';
+    const moreBtn = document.createElement('button');
+    moreBtn.className = 'btn secondary small';
+    moreBtn.textContent = `⬇ Load more (${chans.length - visible.length} remaining)`;
+    moreBtn.onclick = () => {
+      tvVisibleCount += TV_PAGE_SIZE;
+      renderTVFlat();
+    };
+    moreWrap.appendChild(moreBtn);
+    grid.appendChild(moreWrap);
+  }
+
+  updateLiveStatus();
 }
 
 function renderTVCard(c) {
@@ -2639,13 +3208,16 @@ function renderTVCard(c) {
   const cardStyle = !lv ? '' :
     lv.status === 'dead' ? 'opacity:0.4;filter:grayscale(0.5)' :
     lv.status === 'geoblocked' ? 'opacity:0.55' : '';
+  // loading="lazy" defers below-the-fold image loading — big win when 100+ logos
+  // decoding="async" prevents image decode from blocking render
+  // fetchpriority="low" hints the browser logos aren't critical
   const logoHtml = c.logo
-    ? `<img src="${escapeHtml(c.logo)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><span class="logo-fallback" style="display:none">${initial}</span>`
+    ? `<img src="${escapeHtml(c.logo)}" alt="" loading="lazy" decoding="async" fetchpriority="low" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><span class="logo-fallback" style="display:none">${initial}</span>`
     : `<span class="logo-fallback">${initial}</span>`;
   return `
-    <div class="tv-card ${isActive ? 'active' : ''}" 
+    <div class="tv-card ${isActive ? 'active' : ''}"
          style="position:relative;${cardStyle}"
-         data-name="${escapeHtml(c.name)}" 
+         data-name="${escapeHtml(c.name)}"
          data-url="${escapeHtml(c.url)}"
          data-proxied="${escapeHtml(c.proxied_url || '')}"
          data-group="${escapeHtml(c.group || '')}"
@@ -2731,8 +3303,24 @@ function cssEscape(s) {
 }
 
 // Country + search handlers
+// Restore last country from localStorage on first TV tab open
+try {
+  const savedCountry = localStorage.getItem('tvLastCountry');
+  if (savedCountry) {
+    const sel = document.getElementById('tv-country');
+    // Only restore if the saved value is one of the available options
+    if (sel && [...sel.options].some(o => o.value === savedCountry)) {
+      tvCountry = savedCountry;
+      sel.value = savedCountry;
+    }
+  }
+} catch (e) { /* localStorage may be disabled */ }
+
 document.getElementById('tv-country').addEventListener('change', (e) => {
   tvCountry = e.target.value;
+  try { localStorage.setItem('tvLastCountry', tvCountry); } catch (e2) {}
+  // Reset pagination so user sees the first page of new country
+  tvVisibleCount = TV_PAGE_SIZE;
   loadTV();
 });
 let tvSearchTimer = null;
@@ -2790,6 +3378,7 @@ document.getElementById('tv-test-live').addEventListener('click', async () => {
 // Toggle "Tampilkan hanya yang jalan"
 document.getElementById('tv-working-only').addEventListener('change', (e) => {
   tvWorkingOnly = e.target.checked;
+  tvVisibleCount = TV_PAGE_SIZE;  // reset pagination on filter change
   renderTVFlat();
 });
 

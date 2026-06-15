@@ -2,6 +2,7 @@
 Source: iptv-org index.m3u (semua negara)
 Refresh: cron harian atau manual via endpoint.
 """
+import base64
 import json
 import os
 import re
@@ -15,6 +16,13 @@ SOURCE_URL = "https://iptv-org.github.io/iptv/index.m3u"
 CACHE_MAX_AGE = 86400  # 1 day
 TIMEOUT = 60
 USER_AGENT = "techtalkerid-tv/1.0"
+# Path prefix for proxied URLs embedded in cache. Server uses same path.
+PROXY_PATH = "/api/tv/proxy"
+
+
+def _b64e(s: str) -> str:
+    """Base64 url-safe encode (no padding) for proxy URL params."""
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
 
 # Common categories to expose prominently
 COMMON_CATEGORIES = [
@@ -156,41 +164,74 @@ def load_cache() -> dict | None:
 
 
 def save_cache(channels: list[dict]) -> None:
-    # Build summary stats
-    by_country: dict[str, int] = defaultdict(int)
-    by_category: dict[str, int] = defaultdict(int)
-    for c in channels:
+    """Build cache with pre-computed proxied_url and per-country index.
+
+    Cache schema:
+      {
+        "_meta": { last_refresh, source, count, etag },
+        "channels": [ {name, logo, group, country, lang, url, tvg_id, proxied_url}, ... ],
+        "by_country": { country_name: [channel_indices], ... },  # O(1) country filter
+        "stats": { by_country, by_category, top_countries, common_categories },
+      }
+    """
+    by_country_count: dict[str, int] = defaultdict(int)
+    by_category_count: dict[str, int] = defaultdict(int)
+    by_country_idx: dict[str, list[int]] = defaultdict(list)
+
+    for i, c in enumerate(channels):
         country = c.get("country", "") or "Unknown"
         category = c.get("group", "") or "Other"
-        by_country[country] += 1
-        by_category[category] += 1
+        # Pre-compute proxied_url ONCE per refresh (was done on every API call before)
+        c["proxied_url"] = f"{PROXY_PATH}?u={_b64e(c['url'])}"
+        by_country_count[country] += 1
+        by_category_count[category] += 1
+        by_country_idx[country].append(i)
+
+    last_refresh = datetime.now(timezone.utc).isoformat()
+    etag = 'W/"tv-' + str(int(time.time())) + '"'
 
     data = {
         "_meta": {
-            "last_refresh": datetime.now(timezone.utc).isoformat(),
+            "last_refresh": last_refresh,
             "source": SOURCE_URL,
             "count": len(channels),
+            "etag": etag,
         },
         "channels": channels,
+        "by_country": dict(sorted(by_country_idx.items(), key=lambda x: -len(x[1]))),
         "stats": {
-            "by_country": dict(sorted(by_country.items(), key=lambda x: -x[1])[:50]),
-            "by_category": dict(sorted(by_category.items(), key=lambda x: -x[1])),
+            "by_country": dict(sorted(by_country_count.items(), key=lambda x: -x[1])[:50]),
+            "by_category": dict(sorted(by_category_count.items(), key=lambda x: -x[1])),
             "top_countries": TOP_COUNTRIES,
             "common_categories": COMMON_CATEGORIES,
         },
     }
     tmp = CACHE_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, CACHE_PATH)
 
 
 def get_channels(force: bool = False) -> dict:
-    """Get full channel list. Refresh if stale or force=True."""
+    """Get full channel list. Refresh if stale or force=True.
+
+    On every load, ensure cache has the new schema fields (proxied_url,
+    by_country, etag). If the cache is from an older version, backfill
+    in-place so API responses are immediately optimized.
+    """
     cache = load_cache()
     if cache and not force:
         meta = cache.get("_meta", {})
         last = meta.get("last_refresh")
+        # Backfill new schema fields if missing (one-time migration)
+        if last and "proxied_url" not in (cache.get("channels") or [{}])[0]:
+            print("[tv] migrating cache to new schema (proxied_url + by_country)…")
+            save_cache(cache.get("channels", []))
+            cache = load_cache()
+        if last and "by_country" not in cache:
+            # Shouldn't happen after save_cache backfill, but be safe
+            save_cache(cache.get("channels", []))
+            cache = load_cache()
         if last:
             try:
                 dt = datetime.fromisoformat(last)
@@ -208,15 +249,37 @@ def get_channels(force: bool = False) -> dict:
         if cache:
             cache.setdefault("_meta", {})["error"] = f"refresh failed: {e}"
             return cache
-        return {"_meta": {"error": str(e)}, "channels": [], "stats": {}}
+        return {"_meta": {"error": str(e)}, "channels": [], "stats": {}, "by_country": {}}
 
 
-def filter_channels(channels: list[dict], country: str = "", category: str = "", search: str = "") -> list[dict]:
-    """Filter by country (case-insensitive prefix or full match), category, and search query."""
-    result = channels
-    if country:
+def filter_channels(cached: dict, country: str = "", category: str = "", search: str = "") -> list[dict]:
+    """Filter channels using pre-built by_country index for O(matches) lookup.
+
+    Falls back to full scan for the (rare) case where the index is missing.
+    """
+    all_channels = cached.get("channels") or []
+    by_country = cached.get("by_country") or {}
+
+    # Country filter — use pre-built index when possible
+    if country and by_country:
         cl = country.lower()
-        result = [c for c in result if (c.get("country") or "").lower() in (cl, cl[:2])]
+        if cl == "all":
+            result = all_channels
+        else:
+            # Match either full name or 2-letter prefix (legacy compatibility)
+            indices = by_country.get(country)
+            if indices is None:
+                # Case-insensitive scan of country keys
+                indices = []
+                for k, v in by_country.items():
+                    if k.lower() == cl or k.lower().startswith(cl[:2]):
+                        indices.extend(v)
+            if not indices:
+                return []
+            result = [all_channels[i] for i in indices]
+    else:
+        result = all_channels
+
     if category:
         cat = category.lower()
         result = [c for c in result if cat in (c.get("group") or "").lower()]
