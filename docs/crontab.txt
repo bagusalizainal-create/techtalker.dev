@@ -1,6 +1,12 @@
+# TechTalkerID services
 @reboot /bin/bash -c 'sleep 10 && tmux new-session -d -s api  "cd /opt/api  && ./venv/bin/uvicorn app:app  --host 127.0.0.1 --port 8002 --workers 2 >> /var/log/techtalkerid/api.log 2>&1"'
 @reboot /bin/bash -c 'sleep 11 && tmux new-session -d -s app  "cd /opt/app  && ./venv/bin/gunicorn app:app --bind 127.0.0.1:8001 --workers 2 >> /var/log/techtalkerid/app.log 2>&1"'
 @reboot /bin/bash -c 'sleep 12 && tmux new-session -d -s dash "cd /opt/dash && ./venv/bin/gunicorn app:app --bind 127.0.0.1:8003 --workers 2 >> /var/log/techtalkerid/dash.log 2>&1"'
+@reboot /bin/bash -c 'sleep 15 && tmux new-session -d -s xhs-mcp "/root/.agent-reach/tools/xiaohongshu/xiaohongshu-mcp >> /var/log/techtalkerid/xhs-mcp.log 2>&1"'
+
+# Data refresh (UTC)
 0 3 * * * cd /opt/app && ./venv/bin/python tv.py --refresh >> /var/log/techtalkerid/tv.log 2>&1
 0 */1 * * * cd /opt/app && ./venv/bin/python worldcup.py --refresh >> /var/log/techtalkerid/worldcup.log 2>&1
-@reboot /bin/bash -c 'sleep 15 && tmux new-session -d -s xhs-mcp "/root/.agent-reach/tools/xiaohongshu/xiaohongshu-mcp >> /var/log/techtalkerid/xhs-mcp.log 2>&1"'
+
+# Auto-push techtalker.dev code to GitHub — every midnight WIB (= 17:00 UTC)
+0 17 * * * /opt/techtalker-source/scripts/auto-push.sh >> /var/log/techtalkerid/auto-push.log 2>&1
