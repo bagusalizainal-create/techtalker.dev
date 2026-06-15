@@ -1,0 +1,211 @@
+# Caddyfile — techtalkerid.dev
+# Multi-subdomain reverse proxy ke app Python di port internal.
+# HTTPS otomatis via Let's Encrypt (cuma butuh DNS A record pointing ke VPS).
+
+# --- Root domain: redirect ke www ---
+techtalkerid.dev, http://techtalkerid.dev {
+    redir https://www.techtalkerid.dev{uri} permanent
+}
+
+# --- Web app utama (Flask) ---
+www.techtalkerid.dev, app.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8001
+    encode gzip zstd
+    header {
+        # Hapus header yang bocor info internal
+        -Server
+        -X-Powered-By
+        # Security headers
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    log {
+        output file /var/log/caddy-extra/web.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# --- API (FastAPI) ---
+api.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8002
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+    }
+    log {
+        output file /var/log/caddy-extra/api.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# --- Dashboard (Flask + psutil) ---
+dash.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8003
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+    }
+    log {
+        output file /var/log/caddy-extra/dash.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+
+# === New services (installed Jun 14 2026) ===
+
+# FileBrowser — file manager for /opt
+files.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8011
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/files.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Meilisearch — search engine
+search.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8012
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+    }
+    log {
+        output file /var/log/caddy-extra/search.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Gitea — self-hosted Git
+git.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8013
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/git.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Navidrome — music server
+music.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8014
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/music.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Uptime Kuma — service monitor
+up.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8015
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/up.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Stirling PDF — PDF tools
+pdf.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8016
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/pdf.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# BookStack — wiki / documentation
+wiki.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8017
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/wiki.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# AdGuard Home — DNS ad-blocker web UI
+adguard.techtalkerid.dev {
+    reverse_proxy 127.0.0.1:8018
+    encode gzip zstd
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+    log {
+        output file /var/log/caddy-extra/adguard.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
