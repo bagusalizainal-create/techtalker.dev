@@ -1,7 +1,7 @@
 # TechTalkerID services
-@reboot /bin/bash -c 'sleep 10 && tmux new-session -d -s api  "cd /opt/api  && ./venv/bin/uvicorn app:app  --host 127.0.0.1 --port 8002 --workers 2 >> /var/log/techtalkerid/api.log 2>&1"'
-@reboot /bin/bash -c 'sleep 11 && tmux new-session -d -s app  "cd /opt/app  && ./venv/bin/gunicorn app:app --bind 127.0.0.1:8001 --workers 2 >> /var/log/techtalkerid/app.log 2>&1"'
-@reboot /bin/bash -c 'sleep 12 && tmux new-session -d -s dash "cd /opt/dash && ./venv/bin/gunicorn app:app --bind 127.0.0.1:8003 --workers 2 >> /var/log/techtalkerid/dash.log 2>&1"'
+@reboot /bin/bash -c 'sleep 10 && tmux new-session -d -s api  "cd /opt/api  && ./venv/bin/uvicorn app:app  --host 0.0.0.0 --port 8002 --workers 2 >> /var/log/techtalkerid/api.log 2>&1"'
+@reboot /bin/bash -c 'sleep 11 && tmux new-session -d -s app  "cd /opt/app  && ./venv/bin/gunicorn app:app --bind 0.0.0.0:8001 --workers 2 >> /var/log/techtalkerid/app.log 2>&1"'
+@reboot /bin/bash -c 'sleep 12 && tmux new-session -d -s dash "cd /opt/dash && ./venv/bin/gunicorn app:app --bind 0.0.0.0:8003 --workers 2 >> /var/log/techtalkerid/dash.log 2>&1"'
 @reboot /bin/bash -c 'sleep 15 && tmux new-session -d -s xhs-mcp "/root/.agent-reach/tools/xiaohongshu/xiaohongshu-mcp >> /var/log/techtalkerid/xhs-mcp.log 2>&1"'
 
 # Data refresh (UTC)
@@ -10,3 +10,5 @@
 
 # Auto-push techtalker.dev code to GitHub — every midnight WIB (= 17:00 UTC)
 0 17 * * * /opt/techtalker-source/scripts/auto-push.sh >> /var/log/techtalkerid/auto-push.log 2>&1
+@reboot /bin/bash -c "sleep 13 && tmux new-session -d -s saveit \"cd /opt/saveit && PORT=3000 HOSTNAME=0.0.0.0 NODE_ENV=production ./node_modules/.bin/next start -p 3000 -H 0.0.0.0 > /var/log/techtalkerid/saveit.log 2>&1\""
+@reboot /bin/bash -c 'sleep 14 && tmux new-session -d -s ziqva "cd /opt/ziqva-ytlive-v2 && PORT=8019 YT_REDIRECT_URI=http://104.207.73.54:8019/oauth2callback node app.js >> /var/log/ziqva/app.log 2>&1"'

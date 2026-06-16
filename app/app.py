@@ -714,6 +714,36 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .section.active { display: block; animation: fade 0.25s; }
   @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
+  /* === YT Live tab (iframe embed Ziqva YT Live) === */
+  #sec-ytlive { padding: 0; }
+  #sec-ytlive .yt-frame-wrap { position: relative; width: 100%;
+                                height: calc(100vh - 180px); min-height: 700px;
+                                border-radius: 12px; overflow: hidden;
+                                background: var(--bg2);
+                                border: 1px solid var(--bg3); }
+  #sec-ytlive iframe { width: 100%; height: 100%; border: 0; display: block; }
+  #sec-ytlive .yt-overlay { position: absolute; inset: 0; display: flex;
+                              align-items: center; justify-content: center;
+                              color: var(--fg3); font-size: 0.9rem;
+                              background: var(--bg2); }
+  #sec-ytlive .yt-overlay.hidden { display: none; }
+  @media (max-width: 768px) { #sec-ytlive .yt-frame-wrap { height: 80vh; min-height: 600px; } }
+
+  /* === Downloader tab (iframe embed SaveIt) === */
+  #sec-downloader { padding: 0; }
+  #sec-downloader .dl-frame-wrap { position: relative; width: 100%;
+                                   height: calc(100vh - 180px); min-height: 700px;
+                                   border-radius: 12px; overflow: hidden;
+                                   background: var(--bg2);
+                                   border: 1px solid var(--bg3); }
+  #sec-downloader iframe { width: 100%; height: 100%; border: 0; display: block; }
+  #sec-downloader .dl-overlay { position: absolute; inset: 0; display: flex;
+                                 align-items: center; justify-content: center;
+                                 color: var(--fg3); font-size: 0.9rem;
+                                 background: var(--bg2); }
+  #sec-downloader .dl-overlay.hidden { display: none; }
+  @media (max-width: 768px) { #sec-downloader .dl-frame-wrap { height: 80vh; min-height: 600px; } }
+
   /* === Hero (Beranda) === */
   .hero { text-align: center; margin-bottom: 40px; }
   .hero h1 { font-size: clamp(2.2rem, 5vw, 3.5rem); font-weight: 800; margin-bottom: 12px;
@@ -1256,6 +1286,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <button data-tab="wc26">⚽ WC26</button>
     <button data-tab="tv">📺 TV</button>
     <button data-tab="api">🔌 API</button>
+    <button data-tab="downloader">📥 Downloader</button>
+    <button data-tab="ytlive">📺 YT Live</button>
   </div>
   <div class="topbar-right">
     <span class="dot"></span>
@@ -1761,6 +1793,51 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <pre>curl "https://www.techtalkerid.dev/api/notes/search?q=halo"</pre>
       <p style="color:var(--fg3);font-size:0.85rem;margin-top:8px">Atau pake subdomain langsung: <code>api.techtalkerid.dev</code> (Swagger UI di <code>/docs</code>)</p>
     </div>
+  </div>
+
+  <!-- ========== DOWNLOADER (SaveIt — Next.js, embedded via iframe) ========== -->
+  <div id="sec-downloader" class="section">
+    <h2 class="section-title">📥 Downloader — YouTube / TikTok / Instagram
+      <span style="font-size:0.72rem;font-weight:400;color:var(--fg3);margin-left:10px">
+        SaveIt • yt-dlp • powered by Next.js
+      </span>
+    </h2>
+    <div class="dl-frame-wrap">
+      <div class="dl-overlay" id="dl-overlay">Loading downloader…</div>
+      <iframe id="dl-iframe"
+              src="/downloader/"
+              title="SaveIt Video Downloader"
+              allow="clipboard-read; clipboard-write"
+              referrerpolicy="same-origin"
+              onload="document.getElementById('dl-overlay').classList.add('hidden')"></iframe>
+    </div>
+    <p style="color:var(--fg3);font-size:0.78rem;margin-top:10px">
+      ⚖️ Personal use only — hormati hak cipta kreator & ToS tiap platform.
+      Download proxied via server, file tidak di-cache.
+    </p>
+  </div>
+
+  <!-- ========== YTLIVE (Ziqva YT Live V2 — Node.js + FFmpeg, embedded via iframe) ========== -->
+  <div id="sec-ytlive" class="section">
+    <h2 class="section-title">📺 YT Live — YouTube Live Automation
+      <span style="font-size:0.72rem;font-weight:400;color:var(--fg3);margin-left:10px">
+        Ziqva YT Live V2 • Node.js + FFmpeg • by Effand
+      </span>
+    </h2>
+    <div class="yt-frame-wrap">
+      <div class="yt-overlay" id="yt-overlay">Loading YT Live panel…</div>
+      <iframe id="yt-iframe"
+              src="http://104.207.73.54:8019/"
+              title="Ziqva YT Live V2"
+              allow="clipboard-read; clipboard-write; microphone; camera"
+              referrerpolicy="no-referrer-when-downgrade"
+              onload="document.getElementById('yt-overlay').classList.add('hidden')"></iframe>
+    </div>
+    <p style="color:var(--fg3);font-size:0.78rem;margin-top:10px">
+      🎥 Panel untuk live YouTube (manual, playlist, scheduled automation, MP3 overlay).
+      First-time setup: buka port <code style="background:var(--bg3);padding:0.1rem 0.4rem;border-radius:4px">:8019</code> di tab baru →
+      Settings → set 6-digit Security PIN & YouTube API credentials.
+    </p>
   </div>
 
 </div>
