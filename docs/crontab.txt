@@ -12,3 +12,4 @@
 0 17 * * * /opt/techtalker-source/scripts/auto-push.sh >> /var/log/techtalkerid/auto-push.log 2>&1
 @reboot /bin/bash -c "sleep 13 && tmux new-session -d -s saveit \"cd /opt/saveit && PORT=3000 HOSTNAME=0.0.0.0 NODE_ENV=production ./node_modules/.bin/next start -p 3000 -H 0.0.0.0 > /var/log/techtalkerid/saveit.log 2>&1\""
 @reboot /bin/bash -c 'sleep 14 && tmux new-session -d -s ziqva "cd /opt/ziqva-ytlive-v2 && PORT=8019 YT_REDIRECT_URI=http://104.207.73.54:8019/oauth2callback node app.js >> /var/log/ziqva/app.log 2>&1"'
+*/1 * * * * flock -n /tmp/threads-monitor.lock /usr/bin/python3.12 /root/scripts/threads-monitor.py --user hklmbn_ >> /root/logs/threads-monitor.log 2>&1
